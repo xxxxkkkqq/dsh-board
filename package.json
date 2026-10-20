@@ -1,0 +1,53 @@
+{
+  "name": "dsh-board",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A canvas beside the conversation: sketch, paste, annotate, then send what you marked. The agent reads the board with board_read and answers on it with board_write.",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "README.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "whiteboard",
+    "canvas",
+    "annotation",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xxxxkkkqq/dsh-board.git"
+  },
+  "homepage": "https://github.com/xxxxkkkqq/dsh-board",
+  "bugs": {
+    "url": "https://github.com/xxxxkkkqq/dsh-board/issues"
+  },
+  "author": "xxxxkkkqq"
+}

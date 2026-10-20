@@ -1,0 +1,13 @@
+# dsh-board bundle patch: one Host row. The row registers the board store, the
+# browser routes, the two board tools and the system-prompt section; the browser
+# half ships as this package's `dsh.client` bundle.
+#
+# Tunables (all optional):
+#   dir            board directory; default `$DSH_HOME/boards`
+#   maxElements    elements accepted per board; default 4000
+#   promptSection  false disables the "Board" system-prompt section
+#   maxImageBytes  largest pasted image accepted, base64 bytes; default 3 MiB
+- insert:
+    - id: board
+      name: 'dsh-board'
+      config: {}
