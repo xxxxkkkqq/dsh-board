@@ -7,6 +7,7 @@
 #   maxElements    elements accepted per board; default 4000
 #   promptSection  false disables the "Board" system-prompt section
 #   maxImageBytes  largest pasted image accepted, base64 bytes; default 3 MiB
+#   boardTtlDays   days before an unopened board is deleted; default 90, 0 keeps
 - insert:
     - id: board
       name: 'dsh-board'

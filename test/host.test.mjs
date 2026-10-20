@@ -3,7 +3,7 @@
  * exercises the tools and the browser routes through the same store the real
  * composition uses. Run with `node test/host.test.mjs`.
  */
-import { mkdtemp, rm, readdir } from 'node:fs/promises'
+import { mkdtemp, rm, readdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert/strict'
@@ -70,7 +70,14 @@ function fakeContext() {
       },
     },
   }
-  return { ctx, tools, sections, routes, disposers }
+  return {
+    ctx, tools, sections, routes, disposers,
+    /** The plugin's store instance, published by `apply` for tests that need to
+     *  drive a sweep directly instead of waiting on the timer. */
+    get store() {
+      return ctx.__boardStore
+    },
+  }
 }
 
 const { ctx, tools, sections, routes } = fakeContext()
@@ -90,6 +97,16 @@ const write = tools.get('board_write')
 
 /** Call one tool with a synthetic agent. */
 let callSeq = 0
+/** @returns {Promise<boolean>} whether the path exists. */
+const exists = async (target) => {
+  try {
+    await stat(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
 const call = (tool, args, agent = { session: { id: sessionId } }) => {
   callSeq += 1
   return tool.execute(args, {
@@ -269,6 +286,93 @@ const before = asked.length
 const immediate = await call(tools.get('board_ask'), { prompt: 'Look at this', wait: false })
 assert.match(immediate.text, /Board opened at rev/)
 assert.equal(asked.length, before, 'wait:false never asks the seam')
+
+// ── image reclaim ──────────────────────────────────────────────────────────
+// A detached image must survive the edit that detaches it, so undo can restore
+// the element, and be reclaimed later — without the sweep ever touching a file
+// a board still references.
+const upload = async () => {
+  const res = await imageRoute.fetch(new Request('http://x/api/board/image', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mediaType: 'image/png', data: png.toString('base64') }),
+  }))
+  return (await res.json()).id
+}
+const imagesOnDisk = async () => {
+  try {
+    return (await readdir(path.join(dir, 'boards', 'images'))).sort()
+  } catch {
+    return []
+  }
+}
+
+const baseline = (await imagesOnDisk()).length
+const keptId = await upload()
+const droppedId = await upload()
+assert.equal((await imagesOnDisk()).length, baseline + 2, 'both uploads are stored')
+
+await call(write, { add: [
+  { type: 'image', x: 0, y: 0, attachmentId: keptId, w: 40, h: 40 },
+  { type: 'image', x: 60, y: 0, attachmentId: droppedId, w: 40, h: 80 },
+] })
+const withImages = await (await routes.get('/api/board/state').fetch(new Request(`http://x/api/board/state?sessionId=${encodeURIComponent(sessionId)}`))).json()
+const droppedElement = withImages.elements.find((element) => element.attachmentId === droppedId)
+await call(write, { remove: [droppedElement.id] })
+assert.equal((await imagesOnDisk()).length, baseline + 2, 'a detached image survives the edit itself, so undo can bring it back')
+
+// An upload that never became an element is unreferenced from the start.
+const strayId = await upload()
+assert.ok((await imagesOnDisk()).includes(`${strayId}.png`), 'the stray upload is on disk')
+
+// A fresh mount rebuilds the queue from disk, which is what makes a restart
+// reclaim what the previous process stranded.
+const reclaim = fakeContext()
+apply(reclaim.ctx, {})
+await new Promise((resolve) => setTimeout(resolve, 200))
+assert.ok(reclaim.store !== undefined, 'a fresh mount exposes its store')
+await reclaim.store.recover()
+const queued = [...reclaim.store.orphans.keys()]
+assert.ok(queued.includes(strayId), 'the unreferenced upload is queued')
+assert.ok(queued.includes(droppedId), 'the detached image is queued')
+assert.ok(!queued.includes(keptId), 'a referenced image is never queued')
+
+// Pretend the grace period elapsed, then sweep.
+for (const id of queued) reclaim.store.orphans.set(id, Date.now() - 60 * 60 * 1000)
+const removed = await reclaim.store.sweep(Date.now())
+assert.equal(removed, 2, 'both orphans were deleted')
+const remaining = await imagesOnDisk()
+assert.ok(remaining.includes(`${keptId}.png`), 'the referenced image remains')
+assert.ok(!remaining.includes(`${droppedId}.png`), 'the detached image is gone')
+assert.ok(!remaining.includes(`${strayId}.png`), 'the stray upload is gone')
+
+// The cache is bounded: many boards must not grow memory without limit.
+for (let index = 0; index < 40; index += 1) {
+  await reclaim.store.get(`bulk:${index}`)
+}
+assert.ok(reclaim.store.docs.size <= 24, `board cache stays bounded (${reclaim.store.docs.size})`)
+assert.ok(reclaim.store.locks.size <= 64, `lock map stays bounded (${reclaim.store.locks.size})`)
+
+// ── abandoned board files ──────────────────────────────────────────────────
+// A board nobody has opened for the TTL goes, but a live one never does.
+await reclaim.store.get('abandoned:one')
+const abandonedFile = reclaim.store.fileOf('abandoned:one')
+await writeFile(abandonedFile, JSON.stringify({ sessionId: 'abandoned:one', rev: 0, elements: [] }), 'utf8')
+const longAgo = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000)
+await utimes(abandonedFile, longAgo, longAgo)
+// Drop it from the cache so it counts as cold.
+reclaim.store.docs.delete('abandoned:one')
+
+const liveFile = reclaim.store.fileOf('live:one')
+await reclaim.store.get('live:one')
+await writeFile(liveFile, JSON.stringify({ sessionId: 'live:one', rev: 0, elements: [] }), 'utf8')
+await utimes(liveFile, longAgo, longAgo)
+
+const ttl = 90 * 24 * 60 * 60 * 1000
+const reclaimed = await reclaim.store.sweepBoards(Date.now(), ttl)
+assert.ok(reclaimed >= 1, 'the abandoned board was reclaimed')
+assert.ok(!(await exists(abandonedFile)), 'the abandoned file is gone')
+assert.ok(await exists(liveFile), 'a board still cached survives even when old')
 
 // ── per-session isolation ──────────────────────────────────────────────────
 result = await call(read, { sessionId: 'session:other' })

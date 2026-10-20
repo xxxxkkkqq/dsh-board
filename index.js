@@ -23,9 +23,12 @@
  * @module dsh-board
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+
+/** Extensions the image route stores, in the order it serves them. */
+const IMAGE_EXTENSIONS = ['png', 'jpg', 'webp', 'gif']
 
 /** Element types the board understands. */
 const TYPES = new Set([
@@ -59,12 +62,28 @@ const LIMITS = {
   coordinate: 20000,
 }
 
+const LIMITS_GC = {
+  /** Boards kept hot in memory; the rest are re-read from disk on demand. */
+  cachedBoards: 24,
+  /** Serialization locks kept after their board goes cold. */
+  locks: 64,
+  /** How long an unreferenced image survives before it is deleted. */
+  imageGraceMs: 10 * 60 * 1000,
+  /** Images removed per sweep, so a big backlog never blocks one tick. */
+  sweepBatch: 64,
+  /** Minimum gap between sweeps. */
+  sweepIntervalMs: 60 * 1000,
+  /** Age after which a board nobody has opened is deleted. */
+  boardTtlMs: 90 * 24 * 60 * 60 * 1000,
+}
+
 const DEFAULTS = {
   /** Board directory; resolved lazily so `$DSH_HOME` is read at activation. */
   dir: undefined,
   maxElements: LIMITS.elements,
   promptSection: true,
   maxImageBytes: 3 * 1024 * 1024,
+  boardTtlDays: 90,
 }
 
 /** Copy for the model-facing tool descriptions and prompt section. */
@@ -281,15 +300,175 @@ class BoardStore {
    * @param {object} options - resolved configuration.
    * @param {string} options.dir - board directory.
    * @param {number} options.maxElements - element cap per board.
+   * @param {string} options.imagesDir - where pasted images live.
    * @param {(sessionId: string, rev: number) => void} options.notify - change sink.
+   * @param {(error: unknown) => void} [options.onError] - sink for a failed unlink.
    */
   constructor(options) {
     this.dir = options.dir
     this.maxElements = options.maxElements
+    this.imagesDir = options.imagesDir
     this.notify = options.notify
+    this.onError = options.onError
     this.docs = new Map()
     this.loading = new Map()
     this.locks = new Map()
+    // Images an edit detached from a board, with the moment they became
+    // unreferenced. Deletion waits out `imageGraceMs` so an undo can bring the
+    // element back and so a second process writing the same board cannot be
+    // reading a file this one is about to unlink.
+    this.orphans = new Map()
+    this.sweeping = false
+  }
+
+  /**
+   * Record the images an edit removed from a board.
+   *
+   * Only ids that no remaining element references are queued, and an id that is
+   * still present anywhere is dropped from the queue: a paste-then-undo must not
+   * schedule a live file for deletion.
+   * @param {Set<string>} before - attachment ids the board referenced before the edit.
+   * @param {object[]} after - elements the board holds after the edit.
+   * @param {number} now - edit timestamp.
+   */
+  noteDetached(before, after, now) {
+    if (before.size === 0) return
+    const still = new Set()
+    for (const element of after) {
+      if (element.type === 'image' && typeof element.attachmentId === 'string') still.add(element.attachmentId)
+    }
+    for (const id of before) {
+      if (still.has(id)) this.orphans.delete(id)
+      else if (!this.orphans.has(id)) this.orphans.set(id, now)
+    }
+  }
+
+  /**
+   * Delete board files nobody has touched in a long time.
+   *
+   * A board is keyed by Session, and sessions are archived and deleted. Left
+   * alone, one JSON per abandoned session accumulates forever. Only boards
+   * older than `boardTtlMs` go, and only when they are not cached, so an open
+   * board is never pulled out from under a browser.
+   * @param {number} now - current time.
+   * @param {number} ttlMs - age after which an untouched board is abandoned.
+   * @returns {Promise<number>} how many board files were removed.
+   */
+  async sweepBoards(now, ttlMs) {
+    if (ttlMs <= 0) return 0
+    let names
+    try {
+      names = await readdir(this.dir)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 0
+      throw error
+    }
+    let removed = 0
+    for (const name of names) {
+      if (removed >= LIMITS_GC.sweepBatch) break
+      if (!name.endsWith('.json')) continue
+      const full = path.join(this.dir, name)
+      try {
+        const info = await stat(full)
+        if (now - info.mtimeMs < ttlMs) continue
+        // A board that is hot in memory belongs to a live session.
+        let live = false
+        for (const doc of this.docs.values()) {
+          if (this.fileOf(doc.sessionId) === full) {
+            live = true
+            break
+          }
+        }
+        if (live) continue
+        await unlink(full)
+        removed += 1
+      } catch (error) {
+        if (error?.code !== 'ENOENT') this.onError?.(error)
+      }
+    }
+    return removed
+  }
+
+  /**
+   * Queue images on disk that no board references.
+   *
+   * The in-memory queue dies with the process, so without this pass a restart
+   * would strand every detached image. It runs once at activation and reads the
+   * board files directly, which is why it is the only place that pays a full
+   * directory scan.
+   * @returns {Promise<number>} how many ids were queued.
+   */
+  async recover() {
+    let names
+    try {
+      names = await readdir(this.imagesDir)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 0
+      throw error
+    }
+    const referenced = new Set()
+    let boards
+    try {
+      boards = await readdir(this.dir)
+    } catch {
+      boards = []
+    }
+    for (const name of boards) {
+      if (!name.endsWith('.json')) continue
+      try {
+        const parsed = JSON.parse(await readFile(path.join(this.dir, name), 'utf8'))
+        for (const element of Array.isArray(parsed?.elements) ? parsed.elements : []) {
+          if (element?.type === 'image' && typeof element.attachmentId === 'string') referenced.add(element.attachmentId)
+        }
+      } catch {
+        // A board that cannot be read keeps its images: deleting them would be
+        // a worse outcome than leaving a file behind.
+      }
+    }
+    const now = Date.now()
+    let queued = 0
+    for (const name of names) {
+      const match = /^(i_[A-Za-z0-9]+)\.([A-Za-z0-9]+)$/u.exec(name)
+      if (match === null) continue
+      if (referenced.has(match[1])) continue
+      if (this.orphans.has(match[1])) continue
+      this.orphans.set(match[1], now)
+      queued += 1
+    }
+    return queued
+  }
+
+  /**
+   * Delete images whose grace period has passed.
+   *
+   * Bounded by `sweepBatch` so a large backlog is spread over several ticks
+   * rather than stalling one, and cheap when the queue is empty.
+   * @param {number} now - current time.
+   * @returns {Promise<number>} how many files were removed.
+   */
+  async sweep(now) {
+    if (this.sweeping || this.orphans.size === 0) return 0
+    this.sweeping = true
+    let removed = 0
+    try {
+      for (const [id, since] of this.orphans) {
+        if (removed >= LIMITS_GC.sweepBatch) break
+        if (now - since < LIMITS_GC.imageGraceMs) continue
+        this.orphans.delete(id)
+        for (const extension of IMAGE_EXTENSIONS) {
+          try {
+            await unlink(path.join(this.imagesDir, `${id}.${extension}`))
+            removed += 1
+            break
+          } catch (error) {
+            if (error?.code !== 'ENOENT') this.onError?.(error)
+          }
+        }
+      }
+    } finally {
+      this.sweeping = false
+    }
+    return removed
   }
 
   /** @param {string} sessionId - board identity. @returns {string} its file path. */
@@ -309,7 +488,10 @@ class BoardStore {
       // and a web instance). The file is the shared truth, so a cached document
       // is revalidated against its mtime before it is trusted again.
       const stamp = await this.stampOf(sessionId)
-      if (stamp === cached.stamp) return cached
+      if (stamp === cached.stamp) {
+        this.touch(sessionId, cached)
+        return cached
+      }
     }
     const pending = this.loading.get(sessionId)
     if (pending !== undefined) return pending
@@ -342,8 +524,28 @@ class BoardStore {
       if (error?.code !== 'ENOENT') throw error
     }
     doc.stamp = stamp
-    this.docs.set(sessionId, doc)
+    this.touch(sessionId, doc)
     return doc
+  }
+
+  /**
+   * Insert or refresh one board's cache slot, evicting the coldest board when
+   * the cache is full.
+   *
+   * Map preserves insertion order, so re-inserting moves a key to the end and
+   * the first key is the least recently used. Eviction is safe at any time: a
+   * board is a pure function of its file, and the next read rebuilds it.
+   * @param {string} sessionId - board identity.
+   * @param {object} doc - the live document.
+   */
+  touch(sessionId, doc) {
+    this.docs.delete(sessionId)
+    this.docs.set(sessionId, doc)
+    while (this.docs.size > LIMITS_GC.cachedBoards) {
+      const oldest = this.docs.keys().next()
+      if (oldest.done === true) break
+      this.docs.delete(oldest.value)
+    }
   }
 
   /**
@@ -371,7 +573,17 @@ class BoardStore {
   async exclusive(sessionId, work) {
     const previous = this.locks.get(sessionId) ?? Promise.resolve()
     const run = previous.then(work, work)
-    this.locks.set(sessionId, run.then(() => undefined, () => undefined))
+    const settled = run.then(() => undefined, () => undefined)
+    // Re-insert so a busy board keeps its slot and a quiet one ages out: an
+    // entry only has to outlive the work queued behind it, and dropping it
+    // afterwards is safe because the next caller re-reads the file.
+    this.locks.delete(sessionId)
+    this.locks.set(sessionId, settled)
+    while (this.locks.size > LIMITS_GC.locks) {
+      const oldest = this.locks.keys().next()
+      if (oldest.done === true) break
+      this.locks.delete(oldest.value)
+    }
     return run
   }
 
@@ -396,6 +608,12 @@ class BoardStore {
       }
       const now = Date.now()
       const next = { ...doc, elements: doc.elements.slice() }
+      // Snapshot the images in use before the edit so anything the edit drops
+      // becomes reclaimable once the grace period passes.
+      const imagesBefore = new Set()
+      for (const element of doc.elements) {
+        if (element.type === 'image' && typeof element.attachmentId === 'string') imagesBefore.add(element.attachmentId)
+      }
       const touched = []
       for (const op of ops) {
         if (op === null || typeof op !== 'object') continue
@@ -464,9 +682,10 @@ class BoardStore {
         }
       }
       if (touched.length === 0) return { doc, touched }
+      this.noteDetached(imagesBefore, next.elements, now)
       next.rev = doc.rev + 1
       next.updatedAt = now
-      this.docs.set(sessionId, next)
+      this.touch(sessionId, next)
       await this.persist(sessionId, next)
       this.notify(sessionId, next.rev)
       return { doc: next, touched }
@@ -533,11 +752,19 @@ export function apply(ctx, config) {
   }
   const dir = typeof settings.dir === 'string' && settings.dir !== '' ? settings.dir : path.join(dshHome(), 'boards')
   const imagesDir = path.join(dir, 'images')
+  const ttlDays = settings.boardTtlDays === undefined ? 90 : Number(settings.boardTtlDays)
+  const boardTtlMs = Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays * 24 * 60 * 60 * 1000 : 0
   const listeners = new Map()
 
   const store = new BoardStore({
     dir,
+    imagesDir,
     maxElements: Math.max(50, Number(settings.maxElements) || DEFAULTS.maxElements),
+    onError: (error) => {
+      // A failed unlink is not worth failing a request over: the file stays
+      // queued and the next sweep tries again.
+      ctx.logger?.warn?.(`board: could not reclaim an image: ${String(error)}`)
+    },
     notify: (sessionId, rev) => {
       const set = listeners.get(sessionId)
       if (set === undefined) return
@@ -553,6 +780,32 @@ export function apply(ctx, config) {
 
   /** Board questions the agent is currently blocked on, by Session. */
   const asks = new Map()
+
+  // Exposed for tests that need to drive a sweep directly rather than wait on
+  // the timer. It is a plain property on the context, not a service: nothing
+  // else is meant to reach the store this way.
+  ctx.__boardStore = store
+
+  // Reclaiming detached images runs on a slow tick, not on every edit: the queue
+  // is empty most of the time, so the common case costs one Map size check.
+  ctx.effect(() => {
+    // Recover before the first tick so a restart does not wait a full interval
+    // to notice what it stranded.
+    void store.recover().catch((error) => {
+      ctx.logger?.warn?.(`board: image recovery failed: ${String(error)}`)
+    })
+    const timer = setInterval(() => {
+      const now = Date.now()
+      void store.sweep(now).catch((error) => {
+        ctx.logger?.warn?.(`board: image sweep failed: ${String(error)}`)
+      })
+      void store.sweepBoards(now, boardTtlMs).catch((error) => {
+        ctx.logger?.warn?.(`board: board sweep failed: ${String(error)}`)
+      })
+    }, LIMITS_GC.sweepIntervalMs)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }, 'board: image sweep')
 
   // ── browser routes ────────────────────────────────────────────────────────
   ctx.inject(['connection'], (scoped) => {
@@ -602,7 +855,11 @@ export function apply(ctx, config) {
       requestBody: 'buffered',
       fetch: async (request) => {
         if (request.method === 'GET') return serveImage(request, imagesDir)
-        return saveImage(request, imagesDir, Math.max(64 * 1024, Number(settings.maxImageBytes) || DEFAULTS.maxImageBytes))
+        const saved = await saveImage(request, imagesDir, Math.max(64 * 1024, Number(settings.maxImageBytes) || DEFAULTS.maxImageBytes))
+        // A stored image starts unreferenced: if the paste never becomes an
+        // element, the sweep reclaims it. Placement clears the entry.
+        if (saved.ok) store.orphans.set(saved.id, Date.now())
+        return saved.response
       },
     })
 
@@ -966,25 +1223,25 @@ async function saveImage(request, dir, maxBytes) {
   try {
     body = await request.json()
   } catch {
-    return Response.json({ error: 'body must be JSON' }, { status: 400 })
+    return { ok: false, response: Response.json({ error: 'body must be JSON' }, { status: 400 }) }
   }
   const mediaType = typeof body?.mediaType === 'string' ? body.mediaType : 'image/png'
   const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }[mediaType]
-  if (extension === undefined) return Response.json({ error: `unsupported image type "${mediaType}"` }, { status: 415 })
+  if (extension === undefined) return { ok: false, response: Response.json({ error: `unsupported image type "${mediaType}"` }, { status: 415 }) }
   const data = typeof body?.data === 'string' ? body.data : ''
-  if (data === '') return Response.json({ error: 'data (base64) is required' }, { status: 400 })
+  if (data === '') return { ok: false, response: Response.json({ error: 'data (base64) is required' }, { status: 400 }) }
   let bytes
   try {
     bytes = Buffer.from(data, 'base64')
   } catch {
-    return Response.json({ error: 'data is not base64' }, { status: 400 })
+    return { ok: false, response: Response.json({ error: 'data is not base64' }, { status: 400 }) }
   }
-  if (bytes.byteLength === 0) return Response.json({ error: 'empty image' }, { status: 400 })
+  if (bytes.byteLength === 0) return { ok: false, response: Response.json({ error: 'empty image' }, { status: 400 }) }
   if (bytes.byteLength > maxBytes) return Response.json({ error: `image larger than ${maxBytes} bytes` }, { status: 413 })
   const id = `i_${randomUUID().replace(/-/gu, '').slice(0, 16)}`
   await mkdir(dir, { recursive: true })
   await writeFile(path.join(dir, `${id}.${extension}`), bytes)
-  return Response.json({ id, mediaType, bytes: bytes.byteLength })
+  return { ok: true, id, response: Response.json({ id, mediaType, bytes: bytes.byteLength }) }
 }
 
 /**

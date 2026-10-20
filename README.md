@@ -77,6 +77,30 @@ overwriting what the agent just wrote. Two processes can share one home, so a
 cached board is revalidated against its file's mtime before it is trusted.
 Images go to `$DSH_HOME/boards/images`.
 
+## Housekeeping
+
+Nothing accumulates. Three things are bounded:
+
+**Images.** Deleting an image element does not unlink its file immediately — the
+id is queued with a ten-minute grace period, so an undo can bring the element
+back. An upload that never became an element is queued from the start. A sweep
+every minute deletes what has expired, at most 64 files per tick so a large
+backlog spreads over several rather than stalling one. With an empty queue the
+tick costs a map size check.
+
+**Board files.** A board is keyed by session, and sessions get archived. Boards
+untouched for 90 days are deleted, unless they are hot in memory — an open board
+is never pulled out from under a browser.
+
+**Memory.** At most 24 boards stay cached, least recently used first; a cache
+miss re-reads the file, which is cheap and always correct. The per-board
+serialization locks are bounded the same way. Neither map grows with the number
+of sessions you have ever opened.
+
+On activation the plugin rebuilds the image queue from disk, so a restart
+reclaims what the previous process stranded rather than waiting for a full
+sweep interval.
+
 ## Configuration
 
 All optional, in the `board` row of `cordis.patch.yml`.
@@ -87,6 +111,7 @@ All optional, in the `board` row of `cordis.patch.yml`.
 | `maxElements` | `4000` | Elements per board. |
 | `promptSection` | `true` | Whether to add the "shared board" system-prompt section. |
 | `maxImageBytes` | `3 MiB` | Largest pasted image. |
+| `boardTtlDays` | `90` | Days before an unopened board is deleted; `0` keeps them. |
 
 ## Install
 
